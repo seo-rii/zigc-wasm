@@ -210,6 +210,107 @@ try {
   console.log('ok: compile and execute a WASI program with stdout');
 
   mkdirSync(join(project, 'source/nested'), { recursive: true });
+  copyFileSync(
+    join(testDirectory, 'fixtures/debug-main.zig'),
+    join(project, 'source/debug-main.zig'),
+  );
+  copyFileSync(
+    join(testDirectory, 'fixtures/nested/debug-helper.zig'),
+    join(project, 'source/nested/debug-helper.zig'),
+  );
+  const irFlags = [
+    '-target',
+    'wasm32-wasi',
+    '-mcpu=mvp',
+    '-O',
+    'debug',
+    '-fllvm',
+    '-fno-libllvm',
+    '-fno-lld',
+    '-fno-emit-bin',
+    '-fno-compiler-rt',
+  ];
+  runCompiler([
+    'build-exe',
+    'source/debug-main.zig',
+    ...irFlags,
+    '-femit-llvm-bc=debug.bc',
+    '-femit-llvm-ir=debug.ll',
+  ]);
+  const bitcodeMagic = [0x42, 0x43, 0xc0, 0xde];
+  assert.deepEqual([...readFileSync(join(project, 'debug.bc')).subarray(0, 4)], bitcodeMagic);
+  const debugIr = readFileSync(join(project, 'debug.ll'), 'utf8');
+  assert.match(debugIr, /target triple = "wasm32-unknown-wasip1-unknown"/);
+  const compilationUnitFile = debugIr.match(
+    /!DICompileUnit\([^\n]*\bfile:\s*!(\d+)/,
+  );
+  assert.ok(compilationUnitFile, 'LLVM debug metadata identifies its compile-unit file');
+  const compilationUnitFileLine = debugIr
+    .split('\n')
+    .find((line) => line.startsWith(`!${compilationUnitFile[1]} = `));
+  assert.match(
+    compilationUnitFileLine,
+    /!DIFile\(filename: "debug-main", directory: "\."\)/,
+    'WASI compile-unit paths are relative to the first preopened working directory',
+  );
+  assert.match(debugIr, /DIFile\(filename: "source\/debug-main\.zig", directory: "\."\)/);
+  assert.match(
+    debugIr,
+    /DIFile\(filename: "source\/nested\/debug-helper\.zig", directory: "\."\)/,
+  );
+  assert.match(debugIr, /DIFile\(filename: "std\/Io\/Writer\.zig", directory: "\/lib"\)/);
+  assert.match(debugIr, /DISubprogram\(name: "addFive"/);
+  assert.match(debugIr, /DILocalVariable\(name: "input", arg: 1/);
+  assert.match(debugIr, /DILocalVariable\(name: "result"/);
+  assert.match(debugIr, /DIBasicType\(name: "i32", size: 32, encoding: DW_ATE_signed\)/);
+  assert.match(debugIr, /DILocation\(line: 3,/);
+  assert.doesNotMatch(debugIr, /DIFile\(filename: "\.\.\/\.\//);
+  assert.doesNotMatch(debugIr, /\/workspace/);
+  assert.ok(!debugIr.includes(project), 'IR metadata must not expose a host-specific project path');
+
+  // Single-component source names must survive independently of the nested case.
+  runCompiler(['build-exe', 'hello-wasi.zig', ...irFlags, '-femit-llvm-ir=relative.ll']);
+  assert.match(
+    readFileSync(join(project, 'relative.ll'), 'utf8'),
+    /DIFile\(filename: "hello-wasi\.zig", directory: "\."\)/,
+  );
+
+  // IR-only output does not implicitly link the compiler runtime. Consumers need
+  // the matching real implementation as bitcode for their separate final link.
+  runCompiler([
+    'build-obj',
+    '/lib/compiler_rt.zig',
+    ...irFlags,
+    '-femit-llvm-bc=compiler_rt.bc',
+    '-femit-llvm-ir=compiler_rt.ll',
+  ]);
+  assert.deepEqual(
+    [...readFileSync(join(project, 'compiler_rt.bc')).subarray(0, 4)],
+    bitcodeMagic,
+  );
+  assert.match(
+    readFileSync(join(project, 'compiler_rt.ll'), 'utf8'),
+    /DIFile\(filename: "compiler_rt\.zig", directory: "\/lib"\)/,
+  );
+
+  const invalidIr = runCompiler(
+    ['build-obj', 'invalid.zig', ...irFlags, '--color', 'off', '-femit-llvm-bc=invalid.bc'],
+    1,
+  );
+  assert.match(invalidIr.stderr, /invalid\.zig:\d+:\d+: error:/);
+  const machineCode = runCompiler(
+    ['build-exe', 'source/debug-main.zig', ...irFlags, '-femit-bin=unsupported.wasm'],
+    1,
+  );
+  assert.match(
+    machineCode.stderr,
+    /producing machine code(?: via LLVM)? requires using the LLVM library/,
+  );
+  assert.doesNotMatch(machineCode.stderr, /RuntimeError|wasm trap|unreachable/i);
+  console.log('ok: LLVM IR and bitcode preserve relative source paths, stdlib roots, local types, and compiler_rt');
+  console.log('ok: LLVM source errors and unsupported machine-code output fail cleanly');
+
+  mkdirSync(join(project, 'source/nested'), { recursive: true });
   writeFileSync(join(project, 'source/nested/input.txt'), 'read nested input\n');
   runCompiler([
     'build-exe',
