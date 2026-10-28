@@ -2,7 +2,9 @@
 
 Build Zig 0.17.0 as a wasm32-wasi (WASI Preview 1) compiler. The compiler
 runs in a WASI host and generates WebAssembly with Zig's self-hosted backend.
-LLVM, Clang, LLD, and native machine-code backends are excluded.
+It can also emit LLVM IR and bitcode with debug metadata using Zig's own IR
+builder. No LLVM libraries, Clang, LLD, or native machine-code backends are
+included in the WASI compiler.
 
 The original zig/0.11.x.patch remains available for the older compiler.
 zig/0.17.0.patch applies to the official 0.17.0 source release, not Zig master.
@@ -59,8 +61,8 @@ The local cache is .zig-cache/local. Serialize invocations that share either
 cache; WASI does not provide the file locks used by the native compiler.
 
 Supported commands: build-exe, build-obj, ast-check, fmt, targets,
-version, env, and help. Always select a WebAssembly output target and use
--fno-llvm -fno-lld. The targets command describes Zig's target database;
+version, env, and help. For direct WebAssembly output, select a WebAssembly
+target and use -fno-llvm -fno-lld. The targets command describes Zig's target database;
 it does not mean this reduced compiler includes every backend.
 
 zig build, build-lib, run, test, cc, C/C++ compilation, package fetching, native output,
@@ -70,6 +72,36 @@ host. The self-hosted Wasm backend has upstream limitations; this is not a
 replacement for the full native Zig distribution. In particular, build-lib
 is disabled because the upstream self-hosted Wasm linker does not emit
 static archives; build-obj produces relocatable objects for later linking.
+
+## LLVM IR and source debugging
+
+The WASI compiler can emit unoptimized LLVM IR and bitcode without libLLVM.
+Use the public output options with -fllvm -fno-libllvm -fno-lld -fno-emit-bin:
+
+    node scripts/run-wasi.mjs dist/0.17.0/zig.wasm dist/0.17.0/lib \
+      build-exe main.zig -target wasm32-wasi -mcpu=mvp -O debug \
+      -fllvm -fno-libllvm -fno-lld -fno-emit-bin -fno-compiler-rt \
+      -femit-llvm-bc=main.bc -femit-llvm-ir=main.ll
+
+Either output option can be used independently. This path keeps Zig's original
+source, function, local-variable, and type metadata. Relative source filenames
+retain all path components and use '.' as their debug directory, relative to
+the working directory preopened as fd 3. The compilation unit uses the same
+base, so nested source directories are not counted twice. Known library roots retain /lib.
+No absolute host directory or browser-specific source root is assumed; configure
+the external debugger's source mapping for the guest paths used by your host.
+
+The final machine-code build and link belong to an external LLVM toolchain.
+For a WASI program, provide the matching compiler_rt implementation and the
+required WASI runtime libraries. Emit compiler_rt as bitcode with the same
+options, using build-obj /lib/compiler_rt.zig instead of build-exe main.zig.
+Zig supplies the program entry point, so do not add a C startup object.
+Retain debug information during code generation and linking to produce DWARF
+sections that an external debugger such as LLDB can read.
+
+This compiler does not include LLDB, WAMR, an LLVM optimizer, or an LLVM
+machine-code generator. Requesting LLVM machine-code output without libLLVM
+still fails with a diagnostic. Normal self-hosted Wasm output remains available.
 
 ## Verify
 
@@ -82,6 +114,10 @@ objects, checks invalid-source diagnostics and exit status,
 and compiles and executes a WASI program that writes to stdout.
 It also checks help, formatting, environment isolation, unsupported commands,
 and a WASI program exercising nested filesystem access and capability rights.
+It also emits real LLVM IR and bitcode, checks nested and single-component
+relative source paths, /lib paths, local-variable/type metadata, and matching
+compiler_rt output. Invalid IR input and unsupported LLVM machine-code output
+must fail cleanly. These tests check compiler output, not an external debugger.
 
 GitHub Actions builds from the pinned archives, runs this test, and uploads
 the resulting compiler bundle as zigc-wasm-0.17.0.

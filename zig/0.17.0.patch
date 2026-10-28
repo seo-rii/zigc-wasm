@@ -43,8 +43,60 @@ index 309ed5d..93c4a46 100644
              if (is_exe_or_dyn_lib) break :s .lib;
              break :s .obj;
          };
+diff --git a/src/codegen/llvm.zig b/src/codegen/llvm.zig
+index a8adfba..1075ce5 100644
+--- a/src/codegen/llvm.zig
++++ b/src/codegen/llvm.zig
+@@ -185,7 +185,12 @@ pub const Object = struct {
+                 // way already, but here we throw all that sweet information
+                 // into the garbage can by converting into absolute paths. What
+                 // a terrible tragedy.
+-                const compile_unit_dir = try zcu.main_mod.root.toAbsolute(&comp.dirs, arena);
++                // WASI file metadata is relative to fd 3, not the module's
++                // source directory. Otherwise nested source paths are doubled.
++                const compile_unit_dir = if (builtin.os.tag == .wasi)
++                    "."
++                else
++                    try zcu.main_mod.root.toAbsolute(&comp.dirs, arena);
+ 
+                 const debug_file = try builder.debugFile(
+                     try builder.metadataString(comp.root_name),
+@@ -562,7 +567,17 @@ pub const Object = struct {
+             }
+ 
+             if (!build_options.have_llvm or !comp.config.use_lib_llvm) {
+-                return diags.fail("emitting without libllvm not implemented", .{});
++                // The pure-Zig builder already serialized unoptimized bitcode.
++                // IR-only consumers run optimization and codegen in their own
++                // LLVM process; neither operation needs libLLVM in this host.
++                if (options.asm_path != null or options.bin_path != null) {
++                    return diags.fail("producing machine code requires using the LLVM library", .{});
++                }
++                if (options.post_ir_path) |path| {
++                    o.builder.printToFilePath(io, Io.Dir.cwd(), path) catch |err|
++                        return diags.fail("failed to write to '{s}': {t}", .{ path, err });
++                }
++                return;
+             }
+ 
+             initializeLLVMTarget(io, comp.root_mod.resolved_target.result.cpu.arch);
+@@ -1425,6 +1440,14 @@ pub const Object = struct {
+                 try o.builder.metadataString(path.sub_path),
+                 try o.builder.metadataString(root),
+             )
++        else if (builtin.os.tag == .wasi)
++            // WASI has no process cwd. Keep complete guest source paths,
++            // relative to the working directory preopened as fd 3.
++            // Do not assume an absolute host or browser-specific source root.
++            try o.builder.debugFile(
++                try o.builder.metadataString(path.sub_path),
++                try o.builder.metadataString(if (std.fs.path.isAbsolute(path.sub_path)) "" else "."),
++            )
+         else blk: {
+             const relative = try std.fs.path.relative(gpa, dirs.cwd, null, dirs.cwd, path.sub_path);
+             defer gpa.free(relative);
 diff --git a/src/dev.zig b/src/dev.zig
-index 6472f65..ae01015 100644
+index 6472f65..1971b20 100644
 --- a/src/dev.zig
 +++ b/src/dev.zig
 @@ -48,6 +48,10 @@ pub const Env = enum {
@@ -52,13 +104,13 @@ index 6472f65..ae01015 100644
      wasm,
  
 +    /// WASI-hosted compiler with the self-hosted WebAssembly backend.
-+    /// Excludes subprocesses, native linkers, LLVM, and compiler servers.
++    /// Includes pure LLVM IR emission, without LLVM libraries or native linkers.
 +    wasm_wasi,
 +
      /// - sema
      /// - `zig build-* -fincremental -fno-llvm -fno-lld -target x86_64-linux --listen=-`
      @"x86_64-linux",
-@@ -216,6 +220,23 @@ pub const Env = enum {
+@@ -216,6 +220,24 @@ pub const Env = enum {
                  => true,
                  else => Env.sema.supports(feature),
              },
@@ -74,6 +126,7 @@ index 6472f65..ae01015 100644
 +                .ast_gen,
 +                .sema,
 +                .legalize,
++                .llvm_backend,
 +                .wasm_backend,
 +                .wasm_linker,
 +                => true,
@@ -82,7 +135,7 @@ index 6472f65..ae01015 100644
              .@"x86_64-linux" => switch (feature) {
                  .stdio_listen,
                  .incremental,
-@@ -335,7 +356,7 @@ pub const Feature = enum {
+@@ -335,7 +357,7 @@ pub const Feature = enum {
  /// Makes the code following the call to this function unreachable if `feature` is disabled.
  pub fn check(comptime feature: Feature) if (env.supports(feature)) void else noreturn {
      if (env.supports(feature)) return;
@@ -91,7 +144,7 @@ index 6472f65..ae01015 100644
  }
  
  /// Makes the code following the call to this function unreachable if all of `features` are disabled.
-@@ -344,14 +365,19 @@ pub fn checkAny(comptime features: []const Feature) if (env.supportsAny(features
+@@ -344,14 +366,19 @@ pub fn checkAny(comptime features: []const Feature) if (env.supportsAny(features
      comptime var feature_tags: []const u8 = "";
      inline for (features[0 .. features.len - 1]) |feature| feature_tags = feature_tags ++ @tagName(feature) ++ ", ";
      feature_tags = feature_tags ++ "or " ++ @tagName(features[features.len - 1]);
@@ -151,10 +204,10 @@ index 745e302..e1ba76c 100644
      const header_offset = try reserveCustomSectionHeader(gpa, binary_bytes);
      defer writeCustomSectionHeader(binary_bytes, header_offset);
 diff --git a/src/main.zig b/src/main.zig
-index 7d9d7e8..e6290d8 100644
+index 7d9d7e8..4516901 100644
 --- a/src/main.zig
 +++ b/src/main.zig
-@@ -125,7 +125,25 @@ const debug_usage = normal_usage ++
+@@ -125,7 +125,26 @@ const debug_usage = normal_usage ++
      \\
  ;
  
@@ -172,7 +225,8 @@ index 7d9d7e8..e6290d8 100644
 +    \\  env              Print compiler environment
 +    \\  help             Print this help
 +    \\
-+    \\Compilation requires a Wasm target and -fno-llvm -fno-lld.
++    \\Machine output requires a Wasm target and -fno-llvm -fno-lld.
++    \\IR-only output uses -fllvm -fno-libllvm -fno-lld -fno-emit-bin.
 +    \\Preopen '.', '/lib', and '/cache', with '.' first (fd 3).
 +    \\
 +;
@@ -181,7 +235,7 @@ index 7d9d7e8..e6290d8 100644
  
  var log_scopes: std.ArrayList([]const u8) = .empty;
  
-@@ -317,10 +335,25 @@ fn mainArgs(
+@@ -317,10 +336,25 @@ fn mainArgs(
  
      const cmd = args[1];
      const cmd_args = args[2..];
@@ -209,7 +263,7 @@ index 7d9d7e8..e6290d8 100644
          .@"build-exe" => {
              dev.check(.build_exe_command);
              return buildOutputType(gpa, arena, io, args, .{ .build = .Exe }, environ_map);
-@@ -434,7 +467,7 @@ fn mainArgs(
+@@ -434,7 +468,7 @@ fn mainArgs(
              });
              defer dirs.deinit(io);
              const host = std.zig.resolveTargetQueryOrFatal(io, .{});
@@ -218,7 +272,7 @@ index 7d9d7e8..e6290d8 100644
              try @import("print_targets.zig").cmdTargets(
                  arena,
                  io,
-@@ -468,7 +501,7 @@ fn mainArgs(
+@@ -468,7 +502,7 @@ fn mainArgs(
              });
              defer dirs.deinit(io);
              const host = std.zig.resolveTargetQueryOrFatal(io, .{});
